@@ -14,7 +14,7 @@ RUN apk add --no-cache \
     py3-virtualenv
 
 # Clone and build MassDNS
-RUN git clone --depth=1 https://github.com/blechschmidt/massdns.git \
+RUN git clone --depth=1 https://github.com/marksowell/massdns.git \
     && cd massdns \
     && make
 
