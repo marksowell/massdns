@@ -1,3 +1,21 @@
+## Added python to container so scripts can be ran in docker container rather than the binary
+
+```bash
+git clone https://github.com/marksowell/massdns.git
+```
+```bash
+cd massdns
+```
+```bash
+docker volume create massdns_data
+```
+```bash
+docker build -t massdns-python .
+```
+```bash
+docker run --rm -v massdns_data:/massdns_data -v /path/to/SecLists/Discovery/DNS:/wordlists -v $(pwd):/output massdns-python scripts.recon --domain example.com --wordlist /wordlists/subdomains-top1million-5000.txt --outfile /output/example.txt
+```
+
 # MassDNS
 ## A high-performance DNS stub resolver
 
