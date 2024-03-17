@@ -84,10 +84,14 @@ def extract_record_data(answer):
 async def get_soa(name, resolver=None):
     if resolver is None:
         resolver = dns.asyncresolver.Resolver()
-    result = await resolver.resolve(name, dns.rdatatype.SOA, raise_on_no_answer=False)
-    for record in result.response.answer + result.response.authority:
-        if record.rdtype == dns.rdatatype.SOA:
-            return str(record.name)
+    parts = name.split('.')
+    for i in range(len(parts)):
+        try_name = '.'.join(parts[i:])
+        result = await resolver.resolve(try_name, dns.rdatatype.SOA, raise_on_no_answer=False)
+        for record in result.response.answer + result.response.authority:
+            if record.rdtype == dns.rdatatype.SOA:
+                return str(record.name)
+    return None
 
 
 async def get_ns_names(name, resolver=None, detect_soa=True):
@@ -340,20 +344,6 @@ async def main():
     with open(resolvers_path, 'w') as resolvers_file:
         soa = await get_soa(domain)
         log('SOA for %s: %s' % (domain, soa))
-        if soa is None:
-          log('SOA record not found for domain {}. Attempting to find at higher level...'.format(domain))
-          domain_labels = domain.split('.')
-          for i in range(len(domain_labels) - 1, 0, -1):
-              higher_domain = '.'.join(domain_labels[i:])
-              soa = await get_soa(higher_domain)
-              if soa:
-                  log('SOA record found for higher domain: {}'.format(higher_domain))
-                  break
-  
-        if soa is None:
-          log('SOA record not found for any domain level. Continuing execution...')
-          # Proceed with the enumeration process without exiting
-
         nameservers = list(map(lambda ns: ns.rstrip('.'), await get_ns_names(soa)))
         log(domain + ' nameservers: %s' % ', '.join(nameservers))
         nameserver_ips = await get_ips(nameservers)
@@ -368,232 +358,218 @@ async def main():
                 log('Some nameservers are down: %s' % ', '.join(non_working))
             nameserver_ips = list(working_ns)
 
-        resolver = dns.asyncresolver.Resolver()
-        resolver.nameservers = nameserver_ips
-        wildcard_test_name = (random_subdomain() + '.' + domain).lower()
+        resolver_file_contents = '\n'.join(nameserver_ips)
+        resolvers_file.write(resolver_file_contents)
 
-        """In case the server returns NXDOMAIN for non-existing names, another rcode is a strong indicator for another
-            type of record existing for a name. (For example, if `A random-subdomain.example.com` returns NXDOMAIN while
-            `A mail.example.com` returns NOERROR, it may be because `MX mail.example.com` exists.)"""
-        try:
-            answer = await resolver.resolve(wildcard_test_name, raise_on_no_answer=False)
-            rcode = answer.response.rcode()
-            server_behavior.global_noerror = rcode == dns.rcode.NOERROR
-        except dns.resolver.NXDOMAIN:
-            server_behavior.global_noerror = False
-        predicate = 'returns' if server_behavior.global_noerror else 'does not return'
-        log('The nameserver ' + predicate + ' NOERROR for non-existing domains.')
+    resolver = dns.asyncresolver.Resolver()
+    resolver.nameservers = nameserver_ips
+    wildcard_test_name = (random_subdomain() + '.' + domain).lower()
 
-        log('Writing enumeration input file ...')
-        total = 1
-        with open(wordlist_path) as wordlist_file, open(permutations_path, 'w') as permutations_file:
-            permutations_file.write(wildcard_test_name + '\n')
-            for line in wordlist_file:
-                subdomain = line.strip()
-                if subdomain == '':
+    """In case the server returns NXDOMAIN for non-existing names, another rcode is a strong indicator for another
+        type of record existing for a name. (For example, if `A random-subdomain.example.com` returns NXDOMAIN while
+        `A mail.example.com` returns NOERROR, it may be because `MX mail.example.com` exists.)"""
+    try:
+        answer = await resolver.resolve(wildcard_test_name, raise_on_no_answer=False)
+        rcode = answer.response.rcode()
+        server_behavior.global_noerror = rcode == dns.rcode.NOERROR
+    except dns.resolver.NXDOMAIN:
+        server_behavior.global_noerror = False
+    predicate = 'returns' if server_behavior.global_noerror else 'does not return'
+    log('The nameserver ' + predicate + ' NOERROR for non-existing domains.')
+
+    log('Writing enumeration input file ...')
+    total = 1
+    with open(wordlist_path) as wordlist_file, open(permutations_path, 'w') as permutations_file:
+        permutations_file.write(wildcard_test_name + '\n')
+        for line in wordlist_file:
+            subdomain = line.strip()
+            if subdomain == '':
+                continue
+            if not subdomain.endswith('.'):
+                subdomain += '.'
+            permutations_file.write((subdomain + domain).lower() + '\n')
+            total += 1
+
+    log('MassDNS enumeration ...')
+
+    massdns_args = [
+        '-s', args.concurrency,
+        '-i', args.interval,
+        '-c', args.resolve_count
+    ]
+    output_flags = ['Je', '--filter', 'NOERROR'] if not server_behavior.global_noerror else ['Je']
+    proc = subprocess.Popen([massdns_path,
+                             '-o', *output_flags,
+                             '--retry', 'never',
+                             '-r', resolvers_path,
+                             '-w', output_path,
+                             '--status-format', 'json',
+                             '--processes', str(cpu_count),
+                             '-t', args.type,
+                             *massdns_args,
+                             permutations_path], stderr=subprocess.PIPE)
+
+    massdns_show_progress(proc, total)
+
+    def filter_answers(_):
+        return False
+
+    log('Output processing ...')
+
+    errors_seen = False
+    if cpu_count <= 1:
+        massdns_outfiles = [output_path]
+    else:
+        massdns_outfiles = [output_path + str(i) for i in range(0, cpu_count)]
+    with MultiFileLineReader(massdns_outfiles) as f:
+        if not args.no_wildcard_filter and server_behavior.global_noerror:
+            for line in f:
+                parsed = json.loads(line)
+                if parsed['name'].rstrip('.') == wildcard_test_name.rstrip('.'):
+                    answers = parsed.get('data', {}).get('answers', [])
+
+                    def func(compare):
+                        def f(section):
+                            cmp = create_rrset(section)
+                            return compare == cmp
+
+                        return f
+
+                    filter_answers = func(create_rrset(answers))
+
+                    break
+
+    dns_tree = DnsNode()
+
+    with MultiFileLineReader(massdns_outfiles) as f:
+        for line in f:
+            parsed = json.loads(line)
+            if parsed['name'].rstrip('.') == wildcard_test_name.rstrip('.'):
+                continue
+            if 'data' in parsed:
+                data = parsed['data']
+                authorities = data.get('authorities', [])
+                answers = data.get('answers', [])
+
+                if filter_answers(answers):
                     continue
-                if not subdomain.endswith('.'):
-                    subdomain += '.'
-                permutations_file.write((subdomain + domain).lower() + '\n')
-                total += 1
 
-        log('MassDNS enumeration ...')
+                # In the case of zone delegation, we mark the delegated node in the DNS tree
+                if 'aa' not in parsed['flags'] and parsed['status'] == 'NOERROR':
+                    auth_server = get_auth_server(authorities, soa)
+                    if auth_server is not None and is_descendant(parsed['name'], auth_server):
+                        added = dns_tree.add(auth_server)
+                        added.data = parsed
+                        added.delegation = True
+                        continue
 
-        massdns_args = [
-            '-s', args.concurrency,
-            '-i', args.interval,
-            '-c', args.resolve_count
-        ]
-        output_flags = ['Je', '--filter', 'NOERROR'] if not server_behavior.global_noerror else ['Je']
+                added = dns_tree.add(parsed['name'])
+                added.data = parsed
+            elif 'error' in parsed:
+                if not errors_seen:
+                    errors_seen = True
+                    sys.stderr.write('Resolving the following names failed:\n')
+                sys.stderr.write(parsed['name'].rstrip('.') + '\n')
+
+    if not args.no_wildcard_filter:
+        log('Writing wildcard test input file ...')
+
+        wildcard_subdomain1 = random_subdomain()
+        wildcard_subdomain2 = random_subdomain()
+        wildcard_check = DnsNode()
+        wildcard_in_path = os.path.join(tempdir, 'wildcard_in')
+        total = 0
+        with open(wildcard_in_path, 'w') as wildcard_file:
+            for name, node in dns_tree.traverse():
+                if len(name) <= len(domain_labels):
+                    continue
+                if node.hits > args.wildcard_threshold and not node.delegation:
+                    normalized = '.'.join(reversed(name))
+                    wildcard_check.add(normalized).data = node.data
+                    wildcard_file.write(wildcard_subdomain1 + '.' + normalized + '\n' +
+                                        wildcard_subdomain2 + '.' + normalized + '\n')
+                    total += 2
+
+        wildcard_out_path = os.path.join(tempdir, 'wildcard_out')
+
         proc = subprocess.Popen([massdns_path,
-                                 '-o', *output_flags,
+                                 '-o', 'Je',
                                  '--retry', 'never',
                                  '-r', resolvers_path,
-                                 '-w', output_path,
+                                 '-w', wildcard_out_path,
                                  '--status-format', 'json',
                                  '--processes', str(cpu_count),
                                  '-t', args.type,
                                  *massdns_args,
-                                 permutations_path], stderr=subprocess.PIPE)
+                                 wildcard_in_path], stderr=subprocess.PIPE)
 
         massdns_show_progress(proc, total)
 
-        def filter_answers(_):
-            return False
-
-        log('Output processing ...')
-
-        errors_seen = False
         if cpu_count <= 1:
-            massdns_outfiles = [output_path]
+            wildcard_out_paths = [wildcard_out_path]
         else:
-            massdns_outfiles = [output_path + str(i) for i in range(0, cpu_count)]
-        with MultiFileLineReader(massdns_outfiles) as f:
-            if not args.no_wildcard_filter and server_behavior.global_noerror:
-                for line in f:
-                    parsed = json.loads(line)
-                    if parsed['name'].rstrip('.') == wildcard_test_name.rstrip('.'):
-                        answers = parsed.get('data', {}).get('answers', [])
-
-                        def func(compare):
-                            def f(section):
-                                cmp = create_rrset(section)
-                                return compare == cmp
-
-                            return f
-
-                        filter_answers = func(create_rrset(answers))
-
-                        break
-
-        dns_tree = DnsNode()
-
-        with MultiFileLineReader(massdns_outfiles) as f:
+            wildcard_out_paths = [wildcard_out_path + str(i) for i in range(0, cpu_count)]
+        wildcard_cmp = {}
+        with MultiFileLineReader(wildcard_out_paths) as f:
             for line in f:
                 parsed = json.loads(line)
-                if parsed['name'].rstrip('.') == wildcard_test_name.rstrip('.'):
+                answers = create_rrset(parsed.get('data', {}).get('answers', []))
+                name = canonicalize(parsed['name'])[:-1]
+
+                node = dns_tree.find(name)
+                if node is None:
                     continue
-                if 'data' in parsed:
-                    data = parsed['data']
-                    authorities = data.get('authorities', [])
-                    answers = data.get('answers', [])
 
-                    if filter_answers(answers):
+                # We use two random strings to filter random records.
+                # As an example, <random1>.sandbox.google.com differs from <random2>.sandbox.google.com.
+                # This means that we cannot infer something useful from differing records below sandbox.google.com.
+                # We treat it as a wildcard then.
+                hashable_name = '.'.join(name)
+                if hashable_name not in wildcard_cmp:
+                    wildcard_cmp[hashable_name] = parsed
+                elif parsed['status'] != wildcard_cmp[hashable_name]['status'] or \
+                        create_rrset(wildcard_cmp[hashable_name].get('data', {}).get('answers', [])) != answers:
+                    child = DnsNode()
+                    child.data = parsed
+                    node.children = {'*': child}
+                    continue
+
+                # Remove those nodes whose records are equal to the wildcard's records
+                erase = []
+                for subdomain, child in node.traverse():
+                    if child.data is None:
                         continue
+                    answers_cmp = create_rrset(child.data.get('data', {}).get('answers', []))
+                    if answers == answers_cmp and parsed['status'] == child.data['status']:
+                        erase.append(subdomain)
+                for n in erase:
+                    node.remove(n)
 
-                    # In the case of zone delegation, we mark the delegated node in the DNS tree
-                    if 'aa' not in parsed['flags'] and parsed['status'] == 'NOERROR':
-                        auth_server = get_auth_server(authorities, soa)
-                        if auth_server is not None and is_descendant(parsed['name'], auth_server):
-                            added = dns_tree.add(auth_server)
-                            added.data = parsed
-                            added.delegation = True
-                            continue
+                if parsed['status'] == 'NOERROR':
+                    child = DnsNode()
+                    child.data = parsed
+                    node.children['*'] = child
 
-                    added = dns_tree.add(parsed['name'])
-                    added.data = parsed
-                elif 'error' in parsed:
-                    if not errors_seen:
-                        errors_seen = True
-                        sys.stderr.write('Resolving the following names failed:\n')
-                    sys.stderr.write(parsed['name'].rstrip('.') + '\n')
-
-        if not args.no_wildcard_filter:
-            log('Writing wildcard test input file ...')
-
-            wildcard_subdomain1 = random_subdomain()
-            wildcard_subdomain2 = random_subdomain()
-            wildcard_check = DnsNode()
-            wildcard_in_path = os.path.join(tempdir, 'wildcard_in')
-            total = 0
-            with open(wildcard_in_path, 'w') as wildcard_file:
-                for name, node in dns_tree.traverse():
-                    if len(name) <= len(domain_labels):
-                        continue
-                    if node.hits > args.wildcard_threshold and not node.delegation:
-                        normalized = '.'.join(reversed(name))
-                        wildcard_check.add(normalized).data = node.data
-                        wildcard_file.write(wildcard_subdomain1 + '.' + normalized + '\n' +
-                                            wildcard_subdomain2 + '.' + normalized + '\n')
-                        total += 2
-
-            wildcard_out_path = os.path.join(tempdir, 'wildcard_out')
-
-            proc = subprocess.Popen([massdns_path,
-                                     '-o', 'Je',
-                                     '--retry', 'never',
-                                     '-r', resolvers_path,
-                                     '-w', wildcard_out_path,
-                                     '--status-format', 'json',
-                                     '--processes', str(cpu_count),
-                                     '-t', args.type,
-                                     *massdns_args,
-                                     wildcard_in_path], stderr=subprocess.PIPE)
-
-            massdns_show_progress(proc, total)
-
-            if cpu_count <= 1:
-                wildcard_out_paths = [wildcard_out_path]
-            else:
-                wildcard_out_paths = [wildcard_out_path + str(i) for i in range(0, cpu_count)]
-            wildcard_cmp = {}
-            with MultiFileLineReader(wildcard_out_paths) as f:
-                for line in f:
-                    parsed = json.loads(line)
-                    answers = create_rrset(parsed.get('data', {}).get('answers', []))
-                    name = canonicalize(parsed['name'])[:-1]
-
-                    node = dns_tree.find(name)
-                    if node is None:
-                        continue
-
-                    # We use two random strings to filter random records.
-                    # As an example, <random1>.sandbox.google.com differs from <random2>.sandbox.google.com.
-                    # This means that we cannot infer something useful from differing records below sandbox.google.com.
-                    # We treat it as a wildcard then.
-                    hashable_name = '.'.join(name)
-                    if hashable_name not in wildcard_cmp:
-                        wildcard_cmp[hashable_name] = parsed
-                    elif parsed['status'] != wildcard_cmp[hashable_name]['status'] or \
-                            create_rrset(wildcard_cmp[hashable_name].get('data', {}).get('answers', [])) != answers:
-                        child = DnsNode()
-                        child.data = parsed
-                        node.children = {'*': child}
-                        continue
-
-                    # Remove those nodes whose records are equal to the wildcard's records
-                    erase = []
-                    for subdomain, child in node.traverse():
-                        if child.data is None:
-                            continue
-                        answers_cmp = create_rrset(child.data.get('data', {}).get('answers', []))
-                        if answers == answers_cmp and parsed['status'] == child.data['status']:
-                            erase.append(subdomain)
-                    for subdomain in erase:
-                        node.remove(subdomain)
-            shutil.rmtree(tempdir, ignore_errors=True)
-            return
-
-        if args.format == 'json':
-            json_result = []
-
-        def print_result(name, node):
-            if args.format == 'json':
-                record = {'name': '.'.join(name), 'delegation': node.delegation}
-                if 'data' in node.data:
-                    record['status'] = node.data['status']
-                    record['answers'] = node.data['data']['answers']
-                json_result.append(record)
-                return
-            if node.data is None:
-                log('Could not resolve: %s' % '.'.join(name))
-            else:
-                log('%s (%s)' % ('.'.join(name), node.data['status']))
-                if 'data' in node.data:
-                    for answer in node.data['data']['answers']:
-                        log('  %s %s %s %s' % (answer['type'], answer['class'], answer['name'], answer['data']))
-
-        dns_tree.sort()
-        for name, node in dns_tree.traverse():
-            print_result(name, node)
-
-        if args.outfile:
-            with open(args.outfile, 'w') as f:
-                if args.format == 'json':
-                    json.dump(json_result, f, indent=2)
-                else:
-                    for name, node in dns_tree.traverse():
-                        if node.data is not None:
-                            f.write('.'.join(name) + ' (' + node.data['status'] + ')\n')
-                            for answer in node.data['data']['answers']:
-                                f.write('  %s %s %s %s\n' % (answer['type'], answer['class'], answer['name'],
-                                                             answer['data']))
-                        else:
-                            f.write('.'.join(name) + '\n')
-
-
-if __name__ == '__main__':
+    dns_tree.sort()
+    f = sys.stdout if args.outfile is None else open(args.outfile, 'w')
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+        for name, node in dns_tree.traverse():
+            if len(name) <= len(domain_labels):
+                continue
+            print_name = '.'.join(reversed(name))
+            if node.delegation:
+                print_name = '?.' + print_name
+            if args.format == 'list':
+                f.write(print_name + '\n')
+            else:
+                obj = {
+                    'name': print_name,
+                    'query': node.data
+                }
+                f.write(json.dumps(obj) + '\n')
+    finally:
+        if args.outfile is not None:
+            f.close()
+
+
+asyncio.run(main())
