@@ -82,20 +82,7 @@ def extract_record_data(answer):
 
 
 async def get_soa(name, resolver=None):
-    if resolver is None:
-        resolver = dns.asyncresolver.Resolver()
-    parts = name.split('.')
-    # Start from the current level and move up towards the TLD
-    for i in range(len(parts) - 2):  # Ensure we stop at the second-level domain
-        try_name = '.'.join(parts[i:])
-        try:
-            result = await resolver.resolve(try_name, dns.rdatatype.SOA, raise_on_no_answer=False)
-            for record in result.response.answer + result.response.authority:
-                if record.rdtype == dns.rdatatype.SOA:
-                    return str(record.name), str(record).split(' ')[0]  # Return SOA name and primary NS
-        except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.exception.Timeout, dns.resolver.NoAnswer) as e:
-            continue  # If any error occurs, move to the next higher-level domain
-    return None, None  # Return None if no SOA record is found up to the second-level domain
+    return "test"
 
 
 async def get_ns_names(name, resolver=None, detect_soa=True):
