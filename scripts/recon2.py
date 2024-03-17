@@ -87,10 +87,16 @@ async def get_soa(name, resolver=None):
     parts = name.split('.')
     for i in range(len(parts)):
         try_name = '.'.join(parts[i:])
-        result = await resolver.resolve(try_name, dns.rdatatype.SOA, raise_on_no_answer=False)
-        for record in result.response.answer + result.response.authority:
-            if record.rdtype == dns.rdatatype.SOA:
-                return str(record.name)
+        try:
+            result = await resolver.resolve(try_name, dns.rdatatype.SOA, raise_on_no_answer=False)
+            for record in result.response.answer + result.response.authority:
+                if record.rdtype == dns.rdatatype.SOA:
+                    return str(record.name)
+        except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.exception.Timeout):
+            continue  # Ignore these errors and try the next higher-level domain
+        except dns.resolver.NoAnswer:
+            # No SOA record found, but no other critical error occurred
+            continue
     return None
 
 
