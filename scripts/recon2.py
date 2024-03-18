@@ -111,6 +111,10 @@ async def get_ns_names(name, resolver=None, detect_soa=True):
         for record in result.response.authority:
             if record.rdtype == dns.rdatatype.SOA:
                 return await get_ns_names(str(record.name), resolver, detect_soa=False)
+            elif record.rdtype == dns.rdatatype.NS:
+                # Detected delegation, query the delegated nameserver for NS records
+                delegated_ns = str(record.target)
+                return await get_ns_names(name, dns.asyncresolver.Resolver(configure=False, nameservers=[delegated_ns]), detect_soa=False)
     return extract_record_data(result)
 
 
